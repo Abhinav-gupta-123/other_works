@@ -1,225 +1,167 @@
-# ============================
-# Imports
-# ============================
-import os
-import pandas as pd
 import numpy as np
-from PIL import Image
-from tqdm import tqdm
-import joblib
-import requests
-from io import BytesIO
-
+import pandas as pd
 import torch
-from transformers import CLIPProcessor, CLIPModel
-
-from sklearn.model_selection import KFold
-from lightgbm import LGBMRegressor
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 import optuna
+from sklearn.model_selection import train_test_split
+import time
 
 # ============================
-# Parameters
+# Device Setup (MPS)
 # ============================
-DATA_CSV = "/Users/abhinavgupta/Desktop/ml/train.xlsx"  # columns: image_link, catalog_content, price
-IMAGE_COLUMN = "image_link"
-TEXT_COLUMN = "catalog_content"
-PRICE_COLUMN = "price"
-
-# Device selection: MPS > CUDA > CPU
-if torch.backends.mps.is_available():
-    DEVICE = "mps"
-elif torch.cuda.is_available():
-    DEVICE = "cuda"
-else:
-    DEVICE = "cpu"
-
-print(f"Using device: {DEVICE}")
-BATCH_SIZE = 32  # Increase for faster processing if MPS memory allows
-
-IMAGE_CACHE_DIR = "cached_images"
-
-SAVE_EMBEDDINGS = True
-SAVE_MODEL = True
-SAVE_FINAL_DATA = True
-
-EMBEDDINGS_FILE = "features.npy"
-PRICES_FILE = "prices.npy"
-FINAL_DATA_NPY = "final_training_data.npy"
-FINAL_DATA_CSV = "final_training_data.csv"
-MODEL_FILE = "lgbm_price_model.pkl"
-
-N_TRIALS = 50  # Optuna trials
-N_SPLITS = 5   # K-Fold CV splits
-
-os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
+device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+print(f"[INFO] Using device: {device}")
 
 # ============================
-# Load CLIP model
-# ============================
-print("Loading CLIP model...")
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
-# ============================
-# Load dataset
-# ============================
-df = pd.read_excel(DATA_CSV)
-print(f"Total samples: {len(df)}")
-
-# ============================
-# SMAPE function
+# SMAPE Metric
 # ============================
 def smape(y_true, y_pred):
-    return 100 * np.mean(np.abs(y_pred - y_true) / ((np.abs(y_true) + np.abs(y_pred)) / 2))
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2.0
+    diff = np.abs(y_true - y_pred)
+    return np.mean(np.where(denominator == 0, 0, diff / denominator)) * 100
 
 # ============================
-# Download image function
+# Activation Function Mapper
 # ============================
-def download_image(url, cache_dir=IMAGE_CACHE_DIR):
-    filename = os.path.join(cache_dir, url.split("/")[-1])
-    if not os.path.exists(filename):
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            img = Image.open(BytesIO(response.content)).convert("RGB")
-            img.save(filename)
-        except Exception as e:
-            print(f"Error downloading {url}: {e}")
-            img = Image.new('RGB', (224, 224), color=(0, 0, 0))
-            img.save(filename)
-    else:
-        img = Image.open(filename).convert("RGB")
-    return img
+def get_activation(name):
+    return {
+        'relu': nn.ReLU(),
+        'leaky_relu': nn.LeakyReLU(),
+        'elu': nn.ELU(),
+        'tanh': nn.Tanh()
+    }.get(name, nn.ReLU())
 
 # ============================
-# Generate CLIP embeddings with mixed precision
+# Flexible MLP Model
 # ============================
-def get_clip_embeddings(image_urls, texts, batch_size=32):
-    image_embeddings = []
-    text_embeddings = []
+class MLPRegressor(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, dropout, activation):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            layers.append(nn.Linear(input_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(get_activation(activation))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.model = nn.Sequential(*layers)
 
-    for i in tqdm(range(0, len(image_urls), batch_size), desc="Generating embeddings"):
-        batch_images = []
-        batch_texts = texts[i:i+batch_size]
-
-        for url in image_urls[i:i+batch_size]:
-            img = download_image(url)
-            batch_images.append(img)
-
-        # Mixed precision for MPS
-        with torch.autocast(device_type=DEVICE):
-            inputs = clip_processor(
-                text=batch_texts,
-                images=batch_images,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=77
-            ).to(DEVICE)
-
-            with torch.no_grad():
-                img_emb = clip_model.get_image_features(inputs['pixel_values'])
-                txt_emb = clip_model.get_text_features(inputs['input_ids'], inputs['attention_mask'])
-
-        image_embeddings.append(img_emb.cpu().numpy())
-        text_embeddings.append(txt_emb.cpu().numpy())
-
-        # Optional: save intermediate embeddings every 500 batches
-        if i % (500 * batch_size) == 0 and SAVE_EMBEDDINGS:
-            np.save(EMBEDDINGS_FILE, np.vstack(image_embeddings))
-            print(f"Saved intermediate embeddings at batch {i}")
-
-    image_embeddings = np.vstack(image_embeddings)
-    text_embeddings = np.vstack(text_embeddings)
-    return image_embeddings, text_embeddings
+    def forward(self, x):
+        return self.model(x)
 
 # ============================
-# Generate embeddings
+# Load Dataset
 # ============================
-print("Generating embeddings for all samples...")
-image_embs, text_embs = get_clip_embeddings(
-    df[IMAGE_COLUMN].tolist(),
-    df[TEXT_COLUMN].tolist(),
-    batch_size=BATCH_SIZE
-)
+df = pd.read_csv('/Users/abhinavgupta/Desktop/ml/final_training_data.csv')  # Update path
+X = df.iloc[:, :-1].values.astype(np.float32)
+y = df.iloc[:, -1].values.astype(np.float32)
+
+X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # ============================
-# Concatenate embeddings
-# ============================
-features = np.concatenate([image_embs, text_embs], axis=1)
-target = df[PRICE_COLUMN].values
-print(f"Features shape: {features.shape}, Target shape: {target.shape}")
-
-# Save embeddings and final data
-if SAVE_EMBEDDINGS:
-    np.save(EMBEDDINGS_FILE, features)
-    np.save(PRICES_FILE, target)
-    print(f"Saved embeddings to {EMBEDDINGS_FILE} and prices to {PRICES_FILE}")
-
-if SAVE_FINAL_DATA:
-    final_data = np.concatenate([features, target.reshape(-1, 1)], axis=1)
-    np.save(FINAL_DATA_NPY, final_data)
-    columns = [f"feat_{i}" for i in range(features.shape[1])] + ["price"]
-    pd.DataFrame(final_data, columns=columns).to_csv(FINAL_DATA_CSV, index=False)
-    print(f"Saved final training data as {FINAL_DATA_CSV}")
-
-# ============================
-# Log-transform target
-# ============================
-target_log = np.log1p(target)
-
-# ============================
-# Optuna objective with K-Fold CV
+# Optuna Objective Function
 # ============================
 def objective(trial):
-    params = {
-        'num_leaves': trial.suggest_int('num_leaves', 31, 128),
-        'max_depth': trial.suggest_int('max_depth', 5, 20),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
-        'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-        'min_child_samples': trial.suggest_int('min_child_samples', 10, 100),
-        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-        'random_state': 42
-    }
+    # Hyperparameters
+    hidden_dim = trial.suggest_int('hidden_dim', 64, 1024)
+    num_layers = trial.suggest_int('num_layers', 1, 5)
+    dropout = trial.suggest_float('dropout', 0.0, 0.7)
+    lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128, 256, 512])
+    activation = trial.suggest_categorical('activation', ['relu', 'leaky_relu', 'elu', 'tanh'])
+    optimizer_name = trial.suggest_categorical('optimizer', ['Adam', 'SGD', 'RMSprop'])
+    weight_decay = trial.suggest_float('weight_decay', 1e-8, 1e-2, log=True)
+    epochs = trial.suggest_int('epochs', 10, 50)
 
-    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
-    smape_scores = []
+    # Model
+    model = MLPRegressor(input_dim=X_train.shape[1], hidden_dim=hidden_dim,
+                         num_layers=num_layers, dropout=dropout, activation=activation)
+    model.to(device)
 
-    for train_idx, val_idx in kf.split(features):
-        X_tr, X_val = features[train_idx], features[val_idx]
-        y_tr, y_val = target_log[train_idx], target_log[val_idx]
+    # Optimizer & Loss
+    criterion = nn.MSELoss()
+    optimizer = {
+        'Adam': optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay),
+        'SGD': optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay),
+        'RMSprop': optim.RMSprop(model.parameters(), lr=lr, weight_decay=weight_decay)
+    }[optimizer_name]
 
-        model = LGBMRegressor(**params, n_jobs=-1)
-        model.fit(X_tr, y_tr)
-        y_pred_log = model.predict(X_val)
-        y_pred = np.expm1(y_pred_log)
-        y_val_orig = np.expm1(y_val)
-        smape_scores.append(smape(y_val_orig, y_pred))
+    # DataLoader
+    train_dataset = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train).unsqueeze(1))
+    valid_dataset = TensorDataset(torch.from_numpy(X_valid), torch.from_numpy(y_valid).unsqueeze(1))
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
 
-    return np.mean(smape_scores)
+    # Training Loop
+    for epoch in range(epochs):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+
+    # Validation
+    model.eval()
+    preds, targets = [], []
+    with torch.no_grad():
+        for xb, yb in valid_loader:
+            xb = xb.to(device)
+            pred = model(xb).cpu().numpy().flatten()
+            preds.append(pred)
+            targets.append(yb.numpy().flatten())
+    preds = np.concatenate(preds)
+    targets = np.concatenate(targets)
+    score = smape(targets, preds)
+    return score
 
 # ============================
-# Run Optuna study
+# Run Optuna
 # ============================
-print("Starting Optuna hyperparameter tuning with K-Fold CV...")
 study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=N_TRIALS)
+study.optimize(objective, n_trials=50, show_progress_bar=True)
 
-print("Best hyperparameters:", study.best_params)
-
-# ============================
-# Train final model on full data with log-transform
-# ============================
-best_params = study.best_params
-final_model = LGBMRegressor(**best_params, n_jobs=-1)
-final_model.fit(features, target_log)
+print("Best trial:", study.best_trial.number)
+print("Best SMAPE:", study.best_trial.value)
+print("Best params:", study.best_trial.params)
 
 # ============================
-# Save trained model
+# Retrain and Save Best Model
 # ============================
-if SAVE_MODEL:
-    joblib.dump(final_model, MODEL_FILE)
-    print(f"Saved trained LightGBM model to {MODEL_FILE}")
+best_params = study.best_trial.params
 
-print("Pipeline completed successfully! Optimized for MPS and mixed precision.")
+model = MLPRegressor(
+    input_dim=X_train.shape[1],
+    hidden_dim=best_params['hidden_dim'],
+    num_layers=best_params['num_layers'],
+    dropout=best_params['dropout'],
+    activation=best_params['activation']
+)
+model.to(device)
+
+criterion = nn.MSELoss()
+optimizer = {
+    'Adam': optim.Adam(model.parameters(), lr=best_params['lr'], weight_decay=best_params['weight_decay']),
+    'SGD': optim.SGD(model.parameters(), lr=best_params['lr'], weight_decay=best_params['weight_decay']),
+    'RMSprop': optim.RMSprop(model.parameters(), lr=best_params['lr'], weight_decay=best_params['weight_decay'])
+}[best_params['optimizer']]
+
+train_dataset = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train).unsqueeze(1))
+train_loader = DataLoader(train_dataset, batch_size=best_params['batch_size'], shuffle=True)
+
+for epoch in range(best_params['epochs']):
+    model.train()
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        optimizer.zero_grad()
+        loss = criterion(model(xb), yb)
+        loss.backward()
+        optimizer.step()
+
+# Save the trained model
+save_path = "best_ann_model.pth"
+torch.save(model.state_dict(), save_path)
+print(f"Best model saved to {save_path}")
